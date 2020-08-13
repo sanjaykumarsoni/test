@@ -1,0 +1,450 @@
+using Newtonsoft.Json;
+using System;
+using System.Collections.Generic;
+using System.Data.Entity.Core.Objects;
+using System.IO;
+using System.Linq;
+using System.Net;
+using System.Net.Http;
+using System.Net.Http.Headers;
+using System.Text;
+using System.Threading.Tasks;
+namespace FOTAcompass
+{
+    class Program
+    {
+        public static void Main(string[] args)
+        {
+            int sysJobId = 10020; //hardcoded for now
+            string sysJobDesc = "To Update Compass Training Completion data to GE and Compass Course Data to Salesforce Org B";
+            DateTime? jobStartDate = DateTime.UtcNow;
+            string note = "Test Note";
+            int? created_by_id = 23178;//90001 production/test env
+            int? updated_by_id = 23178;
+            int? sys_run_status_id = 1;
+
+            Console.WriteLine("FOTA fields are getting fetched ....");
+            Console.WriteLine("Fetching next params to_date and from_date ....");
+            Console.WriteLine("************************************");
+            try
+            {
+                var paramsItems = GetNextRunParams(sysJobId);
+                var fromDate = paramsItems[0].Value != null ? Convert.ToDateTime(paramsItems[0].Value) : System.DateTime.UtcNow;
+                var toDate = string.IsNullOrEmpty(paramsItems[1].Value.ToString()) ? System.DateTime.UtcNow : Convert.ToDateTime(paramsItems[1].Value);
+                Console.WriteLine("Job Run Log Started ....");
+                ObjectParameter sysJobLogId = new ObjectParameter("sys_job_run_log_id", typeof(int));
+                sysJobLogId = JobRunLogStart(sysJobId, sysJobDesc, jobStartDate, fromDate, toDate, note, created_by_id, sysJobLogId);
+                Console.WriteLine("Job  logged with Id: {0}", sysJobLogId.Value);
+                Console.WriteLine("Web services started.. updating training completion data to GE");
+                sys_run_status_id = 3;
+                bool isUpdated = TrainingCompletion(toDate, fromDate);
+               
+
+                Console.WriteLine("Job Run Log Ended");
+                sys_run_status_id = 5;
+                DateTime? data_last_modified_date = new DateTime(2019, 02, 01); //to be removed 
+                DateTime? jobEndDate = DateTime.UtcNow;
+                JobRunLogEnd(isUpdated, sysJobId, jobEndDate, data_last_modified_date, sys_run_status_id, note, updated_by_id);
+                Console.WriteLine("-------------------------------------------------------------");
+                Console.WriteLine();
+                Console.WriteLine("Web Service to Send Training Data to Org B Started .....");
+                Console.WriteLine();
+                TrainingCourseDataToSF(toDate, fromDate);
+
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine(ex.Message);
+            }
+            Console.ReadLine();
+
+        }
+
+        #region CompassToGE
+
+        /// <summary>
+        /// To log the Start of the job run
+        /// </summary>
+        /// <param name="sysJobId"></param>
+        /// <param name="sys_job_desc"></param>
+        /// <param name="job_start_date"></param>
+        /// <param name="param_from_date"></param>
+        /// <param name="param_to_date"></param>
+        /// <param name="note"></param>
+        /// <param name="created_by_id"></param>
+        /// <param name="sys_job_run_log_id"></param>
+        private static ObjectParameter JobRunLogStart(int? sysJobId, string sys_job_desc, DateTime? job_start_date, DateTime? param_from_date, DateTime? param_to_date, string note, int? created_by_id, ObjectParameter sys_job_run_log_id)
+        {
+            using (var context = new CompassEntities())
+            {
+                sys_job_run_log_id = new ObjectParameter("sys_job_run_log_id", typeof(int));
+                context.SysJobRunLog_Start(sysJobId, sys_job_desc, job_start_date, param_from_date, param_to_date, note, created_by_id, sys_job_run_log_id);
+            }
+            return sys_job_run_log_id;
+        }
+        /// <summary>
+        /// to log the End of the job run
+        /// </summary>
+        /// <param name="sysJobId"></param>
+        /// <param name="job_end_date"></param>
+        /// <param name="data_last_modified_date"></param>
+        /// JobRunLogEnd
+        /// <param name="sys_run_status_id"></param>
+        /// <param name="note"></param>
+        /// <param name="updated_by_id"></param>
+        private static void JobRunLogEnd(bool isUpdated, int? sysJobId, DateTime? job_end_date, DateTime? data_last_modified_date, int? sys_run_status_id, string note, int? updated_by_id)
+        {
+            using (var context = new CompassEntities())
+            {
+                var rowAffected = context.SysJobRunLog_End(sysJobId, job_end_date, data_last_modified_date, sys_run_status_id, note, updated_by_id);
+                if (rowAffected == -1 && isUpdated)
+                {
+                    Console.WriteLine("Job Run stopped after sucessfully updated rows");
+                }
+                else
+                {
+                    Console.WriteLine("Error while executing JobRunLogEnd procedure");
+                }
+            }
+        }
+
+        /// <summary>
+        /// To get the to_date and from_date parameters.
+        /// </summary>
+        /// <param name="sysJobId"></param>
+        /// <param name="param_todate"></param>
+        /// <param name="param_fromDate"></param>
+        private static List<ObjectParameter> GetNextRunParams(int? sysJobId)
+        {
+            List<ObjectParameter> paramDateList = new List<ObjectParameter>();
+            ObjectParameter param_toDate = new ObjectParameter("param_to_date", typeof(DateTime));
+            ObjectParameter param_fromDate = new ObjectParameter("param_from_date", typeof(DateTime));
+            using (var context = new CompassEntities())
+            {
+                var paramsDates = context.SysJobRunLog_GetNextRunParams(sysJobId, param_fromDate, param_toDate);
+                if (paramsDates == -1)
+                {
+                    Console.WriteLine("Fetched Succesfully Param_From_Date & Param_to_Date");
+                }
+                else
+                {
+                    Console.WriteLine("There are some issues in fetching params");
+                }
+
+            }
+            paramDateList.Add(param_fromDate);
+            paramDateList.Add(param_toDate);
+            return paramDateList;
+        }
+
+        /// <summary>
+        /// To update the list of trainings to GE
+        /// </summary>
+        /// <param name="toDate">Training completion to date</param>
+        /// <param name="fromDate">Training completion from date</param>
+        private static bool TrainingCompletion(DateTime? toDate, DateTime? fromDate)
+        {
+            bool isTrUpdated = false;
+            using (var context = new CompassEntities())
+            {
+                try
+                {
+                    var trainings = context.SendToGe_GetTrainings(fromDate, toDate).ToList();
+                    if (trainings.Count > 0)
+                    {
+                        string url = "http://laxm1191.corp.medtronic.com:50000/RESTAdapter/TrainingCompletionData";
+                        //string url = "http://laxm1291.corp.medtronic.com:50000/RESTAdapter/TrainingCompletionData";
+                        TrainingCompletion trainingCompletion = new TrainingCompletion();
+                        List<ResponseData> trCompletionRespList = new List<ResponseData>();
+                        trainingCompletion.Data = new TrainingCompletionData();
+                        int count = 0;
+                        List<TrainingCompletion> trainingCompletionList = new List<TrainingCompletion>();
+                        foreach (var t in trainings)
+                        {
+                            TrainingCompletionData trainingCompletionData = new TrainingCompletionData();
+                            //Modify code : Is MRN is valid or not, Mrn data is not valid. 
+                            trainingCompletionData.Program_ID = "701J0000002Mee1IAC"; //t.Program_ID.ToString(); //"701J0000002Mee1IAC"; 
+                            trainingCompletionData.Mrn = "8021622";//t.Mrn;// "8021622";
+
+                            trainingCompletionData.Program_Name = t.Program_Name;
+                            trainingCompletionData.Pat_Program_Opt_Out = t.Pat_Program_Opt_Out;
+                            trainingCompletionData.Pat_Program_Opt_In = t.Pat_Program_Opt_In;
+                            trainingCompletionData.Pat_Program_Dt = t.Pat_Program_Dt;
+
+                            trainingCompletionData.Last_Updated_By_System = t.Last_Updated_By_System;
+                            trainingCompletion.Data = trainingCompletionData;
+                            var response = PostData(url, trainingCompletion);
+                            ResponseData myDeserializedResponseData = JsonConvert.DeserializeObject<ResponseData>(response);
+                            trCompletionRespList.Add(myDeserializedResponseData);
+                        }
+                        if (trCompletionRespList.Count > 0)
+                        {
+                            isTrUpdated = true;
+                            Console.WriteLine("*************************************************************");
+
+                            Console.WriteLine("We have updated the list of training completion to GE system and below are the list of responses");
+                            foreach (var training in trCompletionRespList)
+                            {
+                                count++;
+                                if (training.MT_TrainingCompletionData_Response != null && training.MT_TrainingCompletionData_Response.Data != null)
+                                {
+                                    Console.Write(count);
+                                    Console.WriteLine(" : ");
+                                    Console.Write(" Mrn : ");
+                                    Console.WriteLine(training.MT_TrainingCompletionData_Response.Data.Mrn);
+                                    Console.Write(" Updated Date : ");
+                                    Console.WriteLine(training.MT_TrainingCompletionData_Response.Data.UpdDt);
+                                    Console.Write(" Updated Time : ");
+                                    Console.WriteLine(training.MT_TrainingCompletionData_Response.Data.UpdTm);
+                                    Console.WriteLine("*******************************************");
+                                    Console.WriteLine("*******************************************");
+
+                                }
+                            }
+
+                        }
+                        else
+                        {
+                            Console.WriteLine("MRN mismatches or request Json Format Issues");
+                        }
+                    }
+                    else
+                    {
+                        Console.WriteLine("No training completion list available ....");
+                    }
+
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine(ex.Message);
+                }
+            }
+            return isTrUpdated;
+        }
+
+        private static string PostData(string url, TrainingCompletion trainingCompletionList)
+        {
+            string responseText = string.Empty;
+            try
+            {
+                HttpWebRequest request = WebRequest.CreateHttp(url);
+                request.Method = "POST";
+                string data = JsonConvert.SerializeObject(trainingCompletionList, Formatting.Indented);
+                byte[] dataInBytes = Encoding.UTF8.GetBytes(data);
+
+                request.ContentType = "application/json";
+                request.ContentLength = dataInBytes.Length;
+                string encodedUserNameAndPswd = string.Empty;
+                string authUserName = "compass_user";
+                string authPassword = "minimed1";
+                request.Timeout = 1000000;
+                request.Credentials = new NetworkCredential(authUserName, authPassword);
+                encodedUserNameAndPswd = Convert.ToBase64String(System.Text.ASCIIEncoding.ASCII.GetBytes(string.Format("{0}:{1}", authUserName, authPassword)));
+                request.Headers.Add("Authorization", "Basic " + encodedUserNameAndPswd);
+                HttpWebResponse response = null;
+                Stream dataStream = request.GetRequestStream();
+                dataStream.Write(dataInBytes, 0, dataInBytes.Length);
+                dataStream.Close();
+                response = (HttpWebResponse)request.GetResponse();
+                //string statusText = response.StatusDescription;
+                //Console.WriteLine("STATUS: " + statusText);
+                Stream responseStream = response.GetResponseStream();
+                StreamReader reader = new StreamReader(responseStream);
+                responseText = reader.ReadToEnd();
+
+                // Console.WriteLine("RESPONSE: " + responseText);
+
+                reader.Close();
+                dataStream.Close();
+                response.Close();
+            }
+            catch (WebException webex)
+            {
+                WebResponse errResp = webex.Response;
+                using (Stream respStream = errResp.GetResponseStream())
+                {
+                    StreamReader reader = new StreamReader(respStream);
+                    string text = reader.ReadToEnd();
+                }
+            }
+            return responseText;
+        }
+        #endregion
+
+        #region CompassToSF
+        private static bool TrainingCourseDataToSF(DateTime? toDate, DateTime? fromDate)
+        {
+            bool isTrUpdated = false;
+            using (var context = new CompassEntities())
+            {
+                var trainings = context.SendToSFB_GetTrainings(fromDate, toDate).ToList();
+                Console.WriteLine("fetching training Course data from compass ....");
+                //string url = "https://wmcloud-dev.medtronic.com:33600/restv2/trainingStatus";
+                string url = "https://tnmm-test.medtronic.com:33600/restv2/trainingStatus";
+                List<TrainningToSF> trCourseRespList = new List<TrainningToSF>();
+                TrainningToSF trainningToSF = new TrainningToSF();
+                Description description = new Description();
+                description.title = "FOTA training courses assigned or closed.";
+                description.to_date = toDate;
+                description.from_date = fromDate;
+                trainningToSF.description = description;
+                trainningToSF.trainings = new List<Trainning>();
+                foreach (var t in trainings)
+                {
+                    Trainning trainningCourse = new Trainning();
+                    //trainningCourse.completed_date = t.completed_date;
+                    trainningCourse.coordinated_date = t.coordinated_date;
+                    trainningCourse.course_name = t.course_name == null ? string.Empty : t.course_name;
+                    trainningCourse.course_type_name = t.course_type_name == null ? string.Empty : t.course_type_name;
+                    trainningCourse.created_date = t.created_date;
+                    trainningCourse.mrn = t.mrn == null ? string.Empty : t.mrn;
+                    trainningCourse.schedule_date = t.schedule_date;
+                    trainningCourse.trainer_name = t.trainer_name==null ? string.Empty:t.trainer_name;
+                    trainningCourse.trainer_type_name = t.trainer_type_name == null ? string.Empty : t.trainer_type_name;
+                    trainningCourse.training_status_name = t.training_status_name == null ? string.Empty : t.training_status_name;
+                    trainningCourse.trn_course_id = t.trn_course_id;
+                    trainningCourse.trn_course_type_id = t.trn_course_type_id;
+                    trainningCourse.trn_training_id = t.trn_training_id;
+                    trainningCourse.trn_training_status_id = t.trn_training_status_id;
+                    trainningCourse.updated_date = t.updated_date;
+                    trainningToSF.trainings.Add(trainningCourse);
+                }
+                var response = PostDataToSF(url, trainningToSF);
+                if (response)
+                {
+                    Console.WriteLine("Compass To Org B updated Successfully");
+                }
+                else
+                {
+                    Console.WriteLine("Error in Compass To Org B module");
+                }
+            }
+            return isTrUpdated;
+        }
+        private static bool PostDataToSF(string url, TrainningToSF trainingToSF)
+        {
+            bool isUpdated = false;
+            string responseText = string.Empty;
+            try
+            {
+                HttpWebRequest request = WebRequest.CreateHttp(url);
+                request.Method = "POST";
+                string data = JsonConvert.SerializeObject(trainingToSF, Formatting.Indented);
+                byte[] dataInBytes = Encoding.UTF8.GetBytes(data);
+                
+                request.ContentType = "application/json";
+                request.ContentLength = dataInBytes.Length;
+                string encodedUserNameAndPswd = string.Empty;
+                string authUserName = "compassuser";
+                string authPassword = "Compa@1";
+                request.Timeout = 1000000;
+                request.Credentials = new NetworkCredential(authUserName, authPassword);
+                encodedUserNameAndPswd = Convert.ToBase64String(System.Text.ASCIIEncoding.ASCII.GetBytes(string.Format("{0}:{1}", authUserName, authPassword)));
+                request.Headers.Add("Authorization", "Basic " + encodedUserNameAndPswd);
+                HttpWebResponse response = null;
+
+                Stream dataStream = request.GetRequestStream();
+                dataStream.Write(dataInBytes, 0, dataInBytes.Length);
+                dataStream.Close();
+                response = (HttpWebResponse)request.GetResponse();
+                Stream responseStream = response.GetResponseStream();
+                StreamReader reader = new StreamReader(responseStream);
+                responseText = reader.ReadToEnd();
+
+                reader.Close();
+                dataStream.Close();
+                response.Close();
+                isUpdated = true;
+            }
+            catch (WebException webex)
+            {
+                WebResponse errResp = webex.Response;
+                using (Stream respStream = errResp.GetResponseStream())
+                {
+                    StreamReader reader = new StreamReader(respStream);
+                    string text = reader.ReadToEnd();
+                }
+            }
+            return isUpdated;
+        }
+        #endregion
+    }
+
+    #region CompassToGE Model
+    public class Data
+    {
+        public int Mrn { get; set; }
+        public string UpdDt { get; set; }
+        public string UpdTm { get; set; }
+
+    }
+
+    public class MTTrainingCompletionDataResponse
+    {
+        public Data Data { get; set; }
+
+    }
+
+    public class ResponseData
+    {
+        public MTTrainingCompletionDataResponse MT_TrainingCompletionData_Response { get; set; }
+
+    }
+
+    public class TrainingCompletionData
+    {
+        public string Mrn { get; set; }
+        public string Program_ID { get; set; }
+        public string Program_Name { get; set; }
+        public string Pat_Program_Opt_In { get; set; }
+        public string Pat_Program_Opt_Out { get; set; }
+        public object Pat_Program_Dt { get; set; }
+        public string Last_Updated_By_System { get; set; }
+
+    }
+
+    public class TrainingCompletion
+    {
+        public TrainingCompletionData Data { get; set; }
+
+    }
+    #endregion
+
+    #region CompassToSF Model
+    public class Description
+    {
+        public string title { get; set; }
+        public DateTime? from_date { get; set; }
+        public DateTime? to_date { get; set; }
+
+    }
+    public class Trainning
+    {
+        public int trn_training_id { get; set; }
+        public int trn_course_id { get; set; }
+        public string course_name { get; set; }
+        public int trn_course_type_id { get; set; }
+        public string course_type_name { get; set; }
+        public int trn_training_status_id { get; set; }
+        public string training_status_name { get; set; }
+        public string mrn { get; set; }
+        public int trn_trainer_id { get; set; }
+        public string trainer_name { get; set; }
+        public int trn_trainer_type_id { get; set; }
+        public string trainer_type_name { get; set; }
+        public DateTime? coordinated_date { get; set; }
+        public DateTime? schedule_date { get; set; }
+        public DateTime? completed_date { get; set; }
+        public DateTime? created_date { get; set; }
+        public DateTime? updated_date { get; set; }
+
+    }
+    public class TrainningToSF
+    {
+        public Description description { get; set; }
+        public List<Trainning> trainings { get; set; }
+    }
+    #endregion
+}
+
+
